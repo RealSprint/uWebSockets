@@ -1,6 +1,7 @@
 #ifndef SOCKET_UWS_H
 #define SOCKET_UWS_H
 
+#include <openssl/err.h>
 #include "Networking.h"
 
 namespace uS {
@@ -169,14 +170,23 @@ protected:
                 } else if (sent <= 0) {
                     switch (SSL_get_error(socket->ssl, sent)) {
                     case SSL_ERROR_WANT_READ:
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         break;
                     case SSL_ERROR_WANT_WRITE:
                         if ((socket->getPoll() & UV_WRITABLE) == 0) {
                             socket->change(socket->nodeData->loop, socket, socket->setPoll(socket->getPoll() | UV_WRITABLE));
                         }
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         break;
                     default:
                         STATE::onEnd((Socket *) p);
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         return;
                     }
                     break;
@@ -191,14 +201,23 @@ protected:
                 if (length <= 0) {
                     switch (SSL_get_error(socket->ssl, length)) {
                     case SSL_ERROR_WANT_READ:
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         break;
                     case SSL_ERROR_WANT_WRITE:
                         if ((socket->getPoll() & UV_WRITABLE) == 0) {
                             socket->change(socket->nodeData->loop, socket, socket->setPoll(socket->getPoll() | UV_WRITABLE));
                         }
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         break;
                     default:
                         STATE::onEnd((Socket *) p);
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         return;
                     }
                     break;
@@ -310,17 +329,27 @@ protected:
                 if (sent == (ssize_t) message->length) {
                     wasTransferred = false;
                     return true;
-                } else if (sent < 0) {
+                    // CHANGED this to <= 0 instead of < 0 as 0 is regarded as error too
+                } else if (sent <= 0) {
                     switch (SSL_get_error(ssl, sent)) {
                     case SSL_ERROR_WANT_READ:
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         break;
                     case SSL_ERROR_WANT_WRITE:
                         if ((getPoll() & UV_WRITABLE) == 0) {
                             setPoll(getPoll() | UV_WRITABLE);
                             changePoll(this);
                         }
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         break;
                     default:
+                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                        // will keep returning the same value and screwing up our switch-/if cases
+                        ERR_clear_error();
                         return false;
                     }
                 }
