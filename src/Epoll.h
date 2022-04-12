@@ -34,7 +34,8 @@ struct Loop {
     int epfd;
     int numPolls = 0;
     bool cancelledLastTimer;
-    int delay = -1;
+    Timer *processingTimer = nullptr; // the timer we're currently processing a callback for
+    int delay = -1;  // delay to next timer expiry, or -1 if no timers pending
     epoll_event readyEvents[1024];
     std::chrono::system_clock::time_point timepoint;
     std::vector<Timepoint> timers;
@@ -58,7 +59,11 @@ struct Loop {
         delete this;
     }
 
+    void doEpoll(int epollTimeout);
+
     void run();
+
+    void poll();
 
     int getEpollFd() {
         return epfd;
@@ -109,7 +114,10 @@ struct Timer {
             }
             pos++;
         }
-        loop->cancelledLastTimer = true;
+
+        if(loop->processingTimer == this) {
+            loop->cancelledLastTimer = true;
+        }
 
         loop->delay = -1;
         if (loop->timers.size()) {
@@ -243,7 +251,7 @@ struct Async : Poll {
         Poll::stop(loop);
         ::close(state.fd);
         Poll::close(loop, [](Poll *p) {
-            delete p;
+            delete (Async *) p;
         });
     }
 
