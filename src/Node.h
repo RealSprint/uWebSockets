@@ -125,6 +125,33 @@ public:
         return socket;
     }
 
+    // we want to be able to provide our own addrinfo to avoid syncblocking event loop
+    template <uS::Socket *I(Socket *s), void C(Socket *p, bool error)>
+    Socket *connectWithAddrInfo(addrinfo* localAddrInfo, const char *hostname, int port, bool secure, NodeData *nodeData) {
+        Context *netContext = nodeData->netContext;
+
+        uv_os_sock_t fd = netContext->createSocket(localAddrInfo->ai_family, localAddrInfo->ai_socktype, localAddrInfo->ai_protocol);
+        if (fd == INVALID_SOCKET) {
+            return nullptr;
+        }
+
+        ::connect(fd, localAddrInfo->ai_addr, localAddrInfo->ai_addrlen);
+
+        SSL *ssl = nullptr;
+        if (secure) {
+            ssl = SSL_new(nodeData->clientContext);
+            SSL_set_connect_state(ssl);
+            SSL_set_tlsext_host_name(ssl, hostname);
+        }
+
+        Socket initialSocket(nodeData, getLoop(), fd, ssl);
+        uS::Socket *socket = I(&initialSocket);
+
+        socket->setCb(connect_cb<C>);
+        socket->start(loop, socket, socket->setPoll(UV_WRITABLE));
+        return socket;
+    }
+
     // todo: hostname, backlog
     template <void A(Socket *s)>
     bool listen(const char *host, int port, uS::TLS::Context sslContext, int options, uS::NodeData *nodeData, void *user) {
