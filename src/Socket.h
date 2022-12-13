@@ -259,7 +259,7 @@ protected:
                             socket->change(socket->nodeData->loop, socket, socket->setPoll(UV_READABLE));
                             break;
                         }
-                    } else if (sent == SOCKET_ERROR) {
+                    } else if (sent == UWS_SOCKET_ERROR) {
                         if (!netContext->wouldBlock()) {
                             STATE::onEnd((Socket *) p);
                             return;
@@ -279,7 +279,7 @@ protected:
             int length = (int) recv(socket->getFd(), nodeData->recvBuffer, nodeData->recvLength, 0);
             if (length > 0) {
                 STATE::onData((Socket *) p, nodeData->recvBuffer, length);
-            } else if (length <= 0 || (length == SOCKET_ERROR && !netContext->wouldBlock())) {
+            } else if (length <= 0 || (length == UWS_SOCKET_ERROR && !netContext->wouldBlock())) {
                 STATE::onEnd((Socket *) p);
             }
         }
@@ -358,7 +358,7 @@ protected:
                 if (sent == (ssize_t) message->length) {
                     wasTransferred = false;
                     return true;
-                } else if (sent == SOCKET_ERROR) {
+                } else if (sent == UWS_SOCKET_ERROR) {
                     if (!nodeData->netContext->wouldBlock()) {
                         return false;
                     }

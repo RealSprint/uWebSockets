@@ -36,7 +36,7 @@ protected:
         uv_os_sock_t serverFd = listenSocket->getFd();
         Context *netContext = listenSocket->nodeData->netContext;
         uv_os_sock_t clientFd = netContext->acceptSocket(serverFd);
-        if (clientFd == INVALID_SOCKET) {
+        if (clientFd == UWS_INVALID_SOCKET) {
             /*
             * If accept is failing, the pending connection won't be removed and the
             * polling will cause the server to spin, using 100% cpu. Switch to a timer
@@ -68,7 +68,7 @@ protected:
             Socket *socket = new Socket(listenSocket->nodeData, listenSocket->nodeData->loop, clientFd, ssl);
             socket->setPoll(UV_READABLE);
             A(socket);
-        } while ((clientFd = netContext->acceptSocket(serverFd)) != INVALID_SOCKET);
+        } while ((clientFd = netContext->acceptSocket(serverFd)) != UWS_INVALID_SOCKET);
     }
 
     Loop *loop;
@@ -102,7 +102,7 @@ public:
         }
 
         uv_os_sock_t fd = netContext->createSocket(result->ai_family, result->ai_socktype, result->ai_protocol);
-        if (fd == INVALID_SOCKET) {
+        if (fd == UWS_INVALID_SOCKET) {
             freeaddrinfo(result);
             return nullptr;
         }
@@ -131,7 +131,7 @@ public:
         Context *netContext = nodeData->netContext;
 
         uv_os_sock_t fd = netContext->createSocket(localAddrInfo->ai_family, localAddrInfo->ai_socktype, localAddrInfo->ai_protocol);
-        if (fd == INVALID_SOCKET) {
+        if (fd == UWS_INVALID_SOCKET) {
             return nullptr;
         }
 
@@ -168,10 +168,10 @@ public:
             return true;
         }
 
-        uv_os_sock_t listenFd = SOCKET_ERROR;
+        uv_os_sock_t listenFd = UWS_SOCKET_ERROR;
         addrinfo *listenAddr;
         if ((options & uS::ONLY_IPV4) == 0) {
-            for (addrinfo *a = result; a && listenFd == SOCKET_ERROR; a = a->ai_next) {
+            for (addrinfo *a = result; a && listenFd == UWS_SOCKET_ERROR; a = a->ai_next) {
                 if (a->ai_family == AF_INET6) {
                     listenFd = netContext->createSocket(a->ai_family, a->ai_socktype, a->ai_protocol);
                     listenAddr = a;
@@ -179,14 +179,14 @@ public:
             }
         }
 
-        for (addrinfo *a = result; a && listenFd == SOCKET_ERROR; a = a->ai_next) {
+        for (addrinfo *a = result; a && listenFd == UWS_SOCKET_ERROR; a = a->ai_next) {
             if (a->ai_family == AF_INET) {
                 listenFd = netContext->createSocket(a->ai_family, a->ai_socktype, a->ai_protocol);
                 listenAddr = a;
             }
         }
 
-        if (listenFd == SOCKET_ERROR) {
+        if (listenFd == UWS_SOCKET_ERROR) {
             freeaddrinfo(result);
             return true;
         }
