@@ -65,6 +65,44 @@ typename WebSocket<isServer>::PreparedMessage *WebSocket<isServer>::prepareMessa
 }
 
 /*
+ * Prepares a single message with a reserved prefix slot for use with sendPreparedWithPrefix.
+ *
+ * Allocates a buffer laid out as:
+ *   [WS frame header for total length=prefixLen+bodyLen][prefixLen reserved bytes][body bytes]
+ *
+ * The reserved slot is left uninitialised; callers patch in per-recipient prefix bytes
+ * at send time before calling sendPreparedWithPrefix.
+ *
+ * Only supported for isServer=true (server frames are unmasked; masking would require
+ * re-reading the prefix slot at send time which defeats the zero-copy purpose).
+ *
+ * Thread safe
+ *
+ */
+template <bool isServer>
+typename WebSocket<isServer>::PreparedMessage *WebSocket<isServer>::prepareMessageWithPrefix(
+    char *body, size_t bodyLen, size_t prefixLen,
+    OpCode opCode, bool compressed,
+    void(*callback)(WebSocket<isServer> *, void *, bool, void *))
+{
+    PreparedMessage *preparedMessage = new PreparedMessage;
+    preparedMessage->buffer = new char[bodyLen + prefixLen + 10];
+
+    // formatMessage with length=0 writes only the WS header. Pass a non-null placeholder for
+    // strict UB-analyzer compatibility (memcpy with null src + length=0 is technically UB pre-C2x).
+    char placeholder[1] = {0};
+    size_t headerLength = WebSocketProtocol<isServer, WebSocket<isServer>>::formatMessage(
+        preparedMessage->buffer, placeholder, 0, opCode, prefixLen + bodyLen, compressed);
+
+    std::memcpy(preparedMessage->buffer + headerLength + prefixLen, body, bodyLen);
+
+    preparedMessage->length = headerLength + prefixLen + bodyLen;
+    preparedMessage->references = 1;
+    preparedMessage->callback = (void(*)(void *, void *, bool, void *)) callback;
+    return preparedMessage;
+}
+
+/*
  * Prepares a batch of messages to send as one single TCP packet / syscall.
  *
  * Hints: Useful when doing pub/sub-like broadcasts where many recipients should receive many
