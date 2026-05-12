@@ -3,6 +3,8 @@
 
 #include <openssl/err.h>
 #include "Networking.h"
+#include <sys/uio.h>
+#include <new>
 
 namespace uS {
 
@@ -380,7 +382,53 @@ protected:
                         return false;
                     }
                 }
+            } else if (message->prefixLength > 0) {
+                // Scatter-gather write for prefix-mode messages.
+                // The prepared buffer has layout: [ws-header][reserved prefix slot][body]
+                // and message->prefix carries the per-recipient prefix bytes.
+                size_t totalLen = message->length;
+                size_t prefixLen = message->prefixLength;
+                uint8_t lenByte = static_cast<uint8_t>(message->data[1]) & 0x7F;
+                size_t headerLen = (lenByte < 126) ? 2 : ((lenByte == 126) ? 4 : 10);
+                size_t bodyLen = totalLen - headerLen - prefixLen;
+
+                struct iovec iov[3];
+                iov[0].iov_base = const_cast<char*>(message->data);
+                iov[0].iov_len = headerLen;
+                iov[1].iov_base = message->prefix;
+                iov[1].iov_len = prefixLen;
+                iov[2].iov_base = const_cast<char*>(message->data) + headerLen + prefixLen;
+                iov[2].iov_len = bodyLen;
+
+                ssize_t expectedTotal = static_cast<ssize_t>(headerLen + prefixLen + bodyLen);
+                sent = ::writev(getFd(), iov, 3);
+                if (sent == expectedTotal) {
+                    wasTransferred = false;
+                    return true;
+                }
+                if (sent == UWS_SOCKET_ERROR) {
+                    if (!nodeData->netContext->wouldBlock()) {
+                        return false;
+                    }
+                    // EAGAIN/would-block: 0 bytes sent. Must flatten before queueing because
+                    // the legacy drain loop has no concept of prefixLength.
+                    if (!_convertPrefixMessageToContiguous(message, 0, headerLen, prefixLen, bodyLen)) {
+                        return false;
+                    }
+                    // Fall through to the common queue push at the bottom of write().
+                } else if (sent >= 0) {
+                    // Partial write (including sent==0). Flatten remainder.
+                    if (!_convertPrefixMessageToContiguous(message, sent, headerLen, prefixLen, bodyLen)) {
+                        return false;
+                    }
+                }
+
+                if ((getPoll() & UV_WRITABLE) == 0) {
+                    setPoll(getPoll() | UV_WRITABLE);
+                    changePoll(this);
+                }
             } else {
+                // Legacy single-buffer non-SSL path (UNCHANGED from existing code):
                 sent = ::send(getFd(), message->data, message->length, MSG_NOSIGNAL);
                 if (sent == (ssize_t) message->length) {
                     wasTransferred = false;
@@ -465,6 +513,61 @@ protected:
             messagePtr->callbackData = callbackData;
             enqueue(messagePtr);
         }
+    }
+
+private:
+    // Flatten the unsent remainder of a scatter-gather prefix message into a contiguous
+    // buffer owned via `flatOwned`. After this call, the message is legacy-compatible
+    // (prefixLength == 0, data points at the flat buffer, length == remaining bytes,
+    // flatOwned == data so pop() will free it).
+    //
+    // Returns false ONLY on allocation failure (treat as connection-broken).
+    bool _convertPrefixMessageToContiguous(Queue::Message *message, ssize_t alreadySent,
+                                           size_t headerLen, size_t prefixLen, size_t bodyLen) {
+        size_t totalLen = headerLen + prefixLen + bodyLen;
+        if (alreadySent < 0) alreadySent = 0;
+        if (static_cast<size_t>(alreadySent) >= totalLen) {
+            // Fully sent — caller treats this as "no need to queue".
+            message->prefixLength = 0;
+            message->length = 0;
+            return true;
+        }
+
+        size_t remaining = totalLen - static_cast<size_t>(alreadySent);
+        char *flat = nullptr;
+        try {
+            flat = new char[remaining];
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+
+        size_t pos = 0;
+        size_t cursor = static_cast<size_t>(alreadySent);
+
+        if (cursor < headerLen) {
+            size_t take = headerLen - cursor;
+            std::memcpy(flat + pos, message->data + cursor, take);
+            pos += take;
+            cursor += take;
+        }
+        if (cursor < headerLen + prefixLen) {
+            size_t prefixStart = cursor - headerLen;
+            size_t take = prefixLen - prefixStart;
+            std::memcpy(flat + pos, message->prefix + prefixStart, take);
+            pos += take;
+            cursor += take;
+        }
+        if (cursor < totalLen) {
+            size_t bodyStart = cursor - headerLen - prefixLen;
+            size_t take = bodyLen - bodyStart;
+            std::memcpy(flat + pos, message->data + headerLen + prefixLen + bodyStart, take);
+        }
+
+        message->data = flat;
+        message->length = remaining;
+        message->prefixLength = 0;
+        message->flatOwned = flat;
+        return true;
     }
 
 public:
