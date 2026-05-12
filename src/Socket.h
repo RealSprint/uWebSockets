@@ -354,32 +354,99 @@ protected:
         if (messageQueue.empty()) {
 
             if (ssl) {
-                sent = SSL_write(ssl, message->data, (int) message->length);
-                if (sent == (ssize_t) message->length) {
-                    wasTransferred = false;
-                    return true;
-                    // CHANGED this to <= 0 instead of < 0 as 0 is regarded as error too
-                } else if (sent <= 0) {
-                    switch (SSL_get_error(ssl, (int) sent)) {
-                    case SSL_ERROR_WANT_READ:
-                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
-                        // will keep returning the same value and screwing up our switch-/if cases
-                        ERR_clear_error();
-                        break;
-                    case SSL_ERROR_WANT_WRITE:
-                        if ((getPoll() & UV_WRITABLE) == 0) {
-                            setPoll(getPoll() | UV_WRITABLE);
-                            changePoll(this);
+                if (message->prefixLength > 0) {
+                    size_t totalLen = message->length;
+                    size_t prefixLen = message->prefixLength;
+                    uint8_t lenByte = static_cast<uint8_t>(message->data[1]) & 0x7F;
+                    size_t headerLen = (lenByte < 126) ? 2 : ((lenByte == 126) ? 4 : 10);
+                    size_t bodyLen = totalLen - headerLen - prefixLen;
+
+                    // Combine [ws-header][prefix] on stack — at most 10 + 8 = 18 bytes.
+                    char combined[18];
+                    std::memcpy(combined, message->data, headerLen);
+                    std::memcpy(combined + headerLen, message->prefix, prefixLen);
+                    size_t combinedLen = headerLen + prefixLen;
+
+                    ssize_t sent1 = SSL_write(ssl, combined, (int) combinedLen);
+                    if (sent1 == (ssize_t) combinedLen) {
+                        ssize_t sent2 = SSL_write(ssl, message->data + headerLen + prefixLen, (int) bodyLen);
+                        if (sent2 == (ssize_t) bodyLen) {
+                            wasTransferred = false;
+                            return true;
+                        } else if (sent2 <= 0) {
+                            int err = SSL_get_error(ssl, (int) sent2);
+                            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                                if ((getPoll() & UV_WRITABLE) == 0) {
+                                    setPoll(getPoll() | UV_WRITABLE);
+                                    changePoll(this);
+                                }
+                                ERR_clear_error();
+                                // Body must be retried; flatten cursor past combined header+prefix.
+                                if (!_convertPrefixMessageToContiguous(message, combinedLen, headerLen, prefixLen, bodyLen)) {
+                                    return false;
+                                }
+                                // Fall through to common queue push.
+                            } else {
+                                ERR_clear_error();
+                                return false;
+                            }
+                        } else {
+                            // Partial body.
+                            if (!_convertPrefixMessageToContiguous(message, combinedLen + sent2, headerLen, prefixLen, bodyLen)) {
+                                return false;
+                            }
                         }
-                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
-                        // will keep returning the same value and screwing up our switch-/if cases
-                        ERR_clear_error();
-                        break;
-                    default:
-                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
-                        // will keep returning the same value and screwing up our switch-/if cases
-                        ERR_clear_error();
-                        return false;
+                    } else if (sent1 <= 0) {
+                        int err = SSL_get_error(ssl, (int) sent1);
+                        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                            if ((getPoll() & UV_WRITABLE) == 0) {
+                                setPoll(getPoll() | UV_WRITABLE);
+                                changePoll(this);
+                            }
+                            ERR_clear_error();
+                            // Whole message must be retried; flatten from offset 0.
+                            if (!_convertPrefixMessageToContiguous(message, 0, headerLen, prefixLen, bodyLen)) {
+                                return false;
+                            }
+                        } else {
+                            ERR_clear_error();
+                            return false;
+                        }
+                    } else {
+                        // Partial header+prefix.
+                        if (!_convertPrefixMessageToContiguous(message, sent1, headerLen, prefixLen, bodyLen)) {
+                            return false;
+                        }
+                    }
+                } else {
+                    // Legacy single-buffer SSL path — UNCHANGED from existing code:
+                    sent = SSL_write(ssl, message->data, (int) message->length);
+                    if (sent == (ssize_t) message->length) {
+                        wasTransferred = false;
+                        return true;
+                        // CHANGED this to <= 0 instead of < 0 as 0 is regarded as error too
+                    } else if (sent <= 0) {
+                        switch (SSL_get_error(ssl, (int) sent)) {
+                        case SSL_ERROR_WANT_READ:
+                            // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                            // will keep returning the same value and screwing up our switch-/if cases
+                            ERR_clear_error();
+                            break;
+                        case SSL_ERROR_WANT_WRITE:
+                            if ((getPoll() & UV_WRITABLE) == 0) {
+                                setPoll(getPoll() | UV_WRITABLE);
+                                changePoll(this);
+                            }
+                            // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                            // will keep returning the same value and screwing up our switch-/if cases
+                            ERR_clear_error();
+                            break;
+                        default:
+                            // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                            // will keep returning the same value and screwing up our switch-/if cases
+                            ERR_clear_error();
+                            return false;
+                        }
                     }
                 }
             } else if (message->prefixLength > 0) {
