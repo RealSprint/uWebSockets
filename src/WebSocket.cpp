@@ -176,6 +176,7 @@ void WebSocket<isServer>::sendPrepared(typename WebSocket<isServer>::PreparedMes
     Queue::Message *messagePtr = (Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
     messagePtr->data = preparedMessage->buffer;
     messagePtr->length = preparedMessage->length;
+    uS::Socket::Queue::initMessage(messagePtr);
 
     bool wasTransferred;
     if (write(messagePtr, wasTransferred)) {
@@ -194,6 +195,73 @@ void WebSocket<isServer>::sendPrepared(typename WebSocket<isServer>::PreparedMes
         if (callback) {
             callback(this, preparedMessage, true, callbackData);
         }
+    }
+}
+
+/*
+ * Like sendPrepared, but injects per-recipient prefix bytes immediately after the WS frame
+ * header. prefix is copied into the queued Message; safe to pass stack memory.
+ * prefixLen must match the value passed to prepareMessageWithPrefix.
+ *
+ * Returns false if the send/queue could not be completed (treat as connection-broken).
+ *
+ * Not thread safe.
+ */
+template <bool isServer>
+bool WebSocket<isServer>::sendPreparedWithPrefix(typename WebSocket<isServer>::PreparedMessage *preparedMessage,
+                                                  const char *prefix, size_t prefixLen,
+                                                  void *callbackData)
+{
+    if (!isServer) {
+        // Mirrors prepareMessageWithPrefix's CLIENT guard — masking would corrupt the prefix.
+        return false;
+    }
+
+    if (prefixLen == 0 || prefixLen > sizeof(uS::Socket::Queue::Message::prefix)) {
+        return false;
+    }
+
+    preparedMessage->references++;
+    void (*callback)(void *webSocket, void *userData, bool cancelled, void *reserved) =
+        [](void *webSocket, void *userData, bool cancelled, void *reserved) {
+            PreparedMessage *preparedMessage = (PreparedMessage *) userData;
+            bool lastReference = !--preparedMessage->references;
+
+            if (preparedMessage->callback) {
+                preparedMessage->callback(webSocket, reserved, cancelled, (void *) lastReference);
+            }
+            if (lastReference) {
+                delete [] preparedMessage->buffer;
+                delete preparedMessage;
+            }
+        };
+
+    int memoryLength = sizeof(typename uS::Socket::Queue::Message);
+    int memoryIndex = nodeData->getMemoryBlockIndex(memoryLength);
+    typename uS::Socket::Queue::Message *messagePtr =
+        (typename uS::Socket::Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
+
+    messagePtr->data = preparedMessage->buffer;
+    messagePtr->length = preparedMessage->length;
+    uS::Socket::Queue::initMessage(messagePtr);
+    std::memcpy(messagePtr->prefix, prefix, prefixLen);
+    messagePtr->prefixLength = static_cast<uint8_t>(prefixLen);
+
+    bool wasTransferred;
+    if (write(messagePtr, wasTransferred)) {
+        if (!wasTransferred) {
+            nodeData->freeSmallMemoryBlock((char *) messagePtr, memoryIndex);
+            callback(this, preparedMessage, false, callbackData);
+        } else {
+            messagePtr->callback = callback;
+            messagePtr->callbackData = preparedMessage;
+            messagePtr->reserved = callbackData;
+        }
+        return true;
+    } else {
+        nodeData->freeSmallMemoryBlock((char *) messagePtr, memoryIndex);
+        callback(this, preparedMessage, true, callbackData);
+        return false;
     }
 }
 

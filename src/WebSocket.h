@@ -64,6 +64,20 @@ public:
 
     // Not thread safe
     void sendPrepared(PreparedMessage *preparedMessage, void *callbackData = nullptr);
+    // Like sendPrepared but injects per-recipient `prefix` bytes immediately after the WS frame
+    // header. `prefix` is copied into the queued Message; safe to pass stack memory.
+    // `prefixLen` must match the value passed to prepareMessageWithPrefix.
+    //
+    // Returns false if the send/queue could not be completed (treat as connection-broken;
+    // callers should abort fan-out loops on false, mirroring `send()`'s contract).
+    //
+    // THREAD INVARIANT: prepareMessageWithPrefix/sendPreparedWithPrefix/finalizeMessage and
+    // the queue drain MUST all happen on the same uWS loop thread.
+    //
+    // Not thread safe.
+    bool sendPreparedWithPrefix(PreparedMessage *preparedMessage,
+                                const char *prefix, size_t prefixLen,
+                                void *callbackData = nullptr);
     static void finalizeMessage(PreparedMessage *preparedMessage);
     void close(int code = 1000, const char *message = nullptr, size_t length = 0);
     void transfer(Group<isServer> *group);

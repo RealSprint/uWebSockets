@@ -40,15 +40,42 @@ protected:
         struct Message {
             const char *data;
             size_t length;
-            Message *nextMessage = nullptr;
-            void (*callback)(void *socket, void *data, bool cancelled, void *reserved) = nullptr;
-            void *callbackData = nullptr, *reserved = nullptr;
+            // Per-recipient prefix bytes injected at send time. prefixLength == 0 = legacy
+            // single-buffer path; > 0 = scatter-gather. Stored inline so each queued Message
+            // owns its own copy.
+            uint8_t prefix[8];
+            uint8_t prefixLength;
+            // When non-null: this Message owns a malloc'd buffer (pop() must `delete[]` it).
+            // Used by partial-write flatten path; distinct from `data` because `data` may
+            // advance past allocation start during partial drains.
+            char *flatOwned;
+            Message *nextMessage;
+            void (*callback)(void *socket, void *data, bool cancelled, void *reserved);
+            void *callbackData, *reserved;
         };
+
+        static_assert(sizeof(Message) <= 96,
+                      "Queue::Message size budget exceeded — verify pool bucket sizing");
+
+        // Centralized zero-init for all fields that callers don't immediately overwrite.
+        // ALL allocation sites that cast raw memory (pool blocks, new char[]) MUST call this.
+        static inline void initMessage(Message *m) {
+            std::memset(m->prefix, 0, sizeof(m->prefix));
+            m->prefixLength = 0;
+            m->flatOwned = nullptr;
+            m->nextMessage = nullptr;
+            m->callback = nullptr;
+            m->callbackData = nullptr;
+            m->reserved = nullptr;
+        }
 
         Message *head = nullptr, *tail = nullptr;
         void pop()
         {
             Message *nextMessage;
+            if (head->flatOwned) {
+                delete [] head->flatOwned;
+            }
             if ((nextMessage = head->nextMessage)) {
                 delete [] (char *) head;
                 head = nextMessage;
@@ -307,7 +334,7 @@ protected:
         Queue::Message *messagePtr = (Queue::Message *) new char[sizeof(Queue::Message) + length];
         messagePtr->length = length;
         messagePtr->data = ((char *) messagePtr) + sizeof(Queue::Message);
-        messagePtr->nextMessage = nullptr;
+        Queue::initMessage(messagePtr);
 
         if (data) {
             memcpy((char *) messagePtr->data, data, messagePtr->length);
@@ -390,6 +417,7 @@ protected:
                 Queue::Message *messagePtr = (Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
                 messagePtr->data = ((char *) messagePtr) + sizeof(Queue::Message);
                 messagePtr->length = T::transform(message, (char *) messagePtr->data, length, transformData);
+                Queue::initMessage(messagePtr);
 
                 bool wasTransferred;
                 if (write(messagePtr, wasTransferred)) {
