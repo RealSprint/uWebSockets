@@ -79,9 +79,10 @@ public:
     // The WS frame's length field is set to (prefixLen + bodyLen) so receivers see a single
     // message of payload [prefix][body].
     //
-    // Only supported for isServer=true (no per-frame masking).
+    // Only supported for isServer=true (no per-frame masking); returns nullptr for CLIENT.
     //
-    // Thread safe.
+    // Thread safe to call; the returned PreparedMessage must not be mutated concurrently
+    // (sendPreparedWithPrefix is not thread-safe and patches the buffer per-call).
     static PreparedMessage *prepareMessageWithPrefix(char *body, size_t bodyLen, size_t prefixLen,
                                                      OpCode opCode, bool compressed,
                                                      void(*callback)(WebSocket<isServer> *webSocket, void *data, bool cancelled, void *reserved) = nullptr);

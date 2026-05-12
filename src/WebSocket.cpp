@@ -85,6 +85,12 @@ typename WebSocket<isServer>::PreparedMessage *WebSocket<isServer>::prepareMessa
     OpCode opCode, bool compressed,
     void(*callback)(WebSocket<isServer> *, void *, bool, void *))
 {
+    if (!isServer) {
+        // CLIENT frames require a per-frame mask key that would corrupt the reserved
+        // prefix slot. The zero-copy fan-out pattern is server-only.
+        return nullptr;
+    }
+
     PreparedMessage *preparedMessage = new PreparedMessage;
     preparedMessage->buffer = new char[bodyLen + prefixLen + 10];
 
