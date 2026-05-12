@@ -415,9 +415,9 @@ protected:
                 int memoryIndex = nodeData->getMemoryBlockIndex(memoryLength);
 
                 Queue::Message *messagePtr = (Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
+                Queue::initMessage(messagePtr);
                 messagePtr->data = ((char *) messagePtr) + sizeof(Queue::Message);
                 messagePtr->length = T::transform(message, (char *) messagePtr->data, length, transformData);
-                Queue::initMessage(messagePtr);
 
                 bool wasTransferred;
                 if (write(messagePtr, wasTransferred)) {
