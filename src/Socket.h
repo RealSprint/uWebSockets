@@ -3,6 +3,7 @@
 
 #include <openssl/err.h>
 #include "Networking.h"
+#include "PrefixFlatten.h"
 #include <sys/uio.h>
 #include <new>
 
@@ -515,6 +516,20 @@ protected:
                 }
             }
         }
+        // If this is a prefix-mode message that was never written (queue was non-empty
+        // on entry so we skipped straight here), flatten it now before enqueuing.
+        // The legacy drain loops (ioHandler / sslIoHandler) only know how to drain
+        // contiguous messages — they have no concept of prefixLength.
+        if (message->prefixLength > 0) {
+            size_t totalLen = message->length;
+            size_t prefixLen = message->prefixLength;
+            uint8_t lenByte = static_cast<uint8_t>(message->data[1]) & 0x7F;
+            size_t headerLen = (lenByte < 126) ? 2 : ((lenByte == 126) ? 4 : 10);
+            size_t bodyLen = totalLen - headerLen - prefixLen;
+            if (!_convertPrefixMessageToContiguous(message, 0, headerLen, prefixLen, bodyLen)) {
+                return false;
+            }
+        }
         messageQueue.push(message);
         wasTransferred = true;
         return true;
@@ -608,27 +623,12 @@ private:
             return false;
         }
 
-        size_t pos = 0;
-        size_t cursor = static_cast<size_t>(alreadySent);
-
-        if (cursor < headerLen) {
-            size_t take = headerLen - cursor;
-            std::memcpy(flat + pos, message->data + cursor, take);
-            pos += take;
-            cursor += take;
-        }
-        if (cursor < headerLen + prefixLen) {
-            size_t prefixStart = cursor - headerLen;
-            size_t take = prefixLen - prefixStart;
-            std::memcpy(flat + pos, message->prefix + prefixStart, take);
-            pos += take;
-            cursor += take;
-        }
-        if (cursor < totalLen) {
-            size_t bodyStart = cursor - headerLen - prefixLen;
-            size_t take = bodyLen - bodyStart;
-            std::memcpy(flat + pos, message->data + headerLen + prefixLen + bodyStart, take);
-        }
+        prefix_flatten_detail::flattenRemainder(
+            flat,
+            message->data, headerLen,
+            reinterpret_cast<const char*>(message->prefix), prefixLen,
+            message->data + headerLen + prefixLen, bodyLen,
+            static_cast<size_t>(alreadySent));
 
         message->data = flat;
         message->length = remaining;
