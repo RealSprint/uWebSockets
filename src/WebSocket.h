@@ -62,6 +62,10 @@ public:
         void(*callback)(void *webSocket, void *data, bool cancelled, void *reserved);
     };
 
+    // Frames send() accepted that have not been written to the kernel yet. Invisible to SIOCOUTQNSD
+    // when the kernel send buffer is full of in-flight bytes.
+    bool hasQueuedMessages() { return !hasEmptyQueue(); }
+
     // Not thread safe
     void sendPrepared(PreparedMessage *preparedMessage, void *callbackData = nullptr);
     static void finalizeMessage(PreparedMessage *preparedMessage);
