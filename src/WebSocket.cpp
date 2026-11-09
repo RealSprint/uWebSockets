@@ -65,6 +65,50 @@ typename WebSocket<isServer>::PreparedMessage *WebSocket<isServer>::prepareMessa
 }
 
 /*
+ * Prepares a single message with a reserved prefix slot for use with sendPreparedWithPrefix.
+ *
+ * Allocates a buffer laid out as:
+ *   [WS frame header for total length=prefixLen+bodyLen][prefixLen reserved bytes][body bytes]
+ *
+ * The reserved slot is left uninitialised; callers patch in per-recipient prefix bytes
+ * at send time before calling sendPreparedWithPrefix.
+ *
+ * Only supported for isServer=true (server frames are unmasked; masking would require
+ * re-reading the prefix slot at send time which defeats the zero-copy purpose).
+ *
+ * Thread safe
+ *
+ */
+template <bool isServer>
+typename WebSocket<isServer>::PreparedMessage *WebSocket<isServer>::prepareMessageWithPrefix(
+    char *body, size_t bodyLen, size_t prefixLen,
+    OpCode opCode, bool compressed,
+    void(*callback)(WebSocket<isServer> *, void *, bool, void *))
+{
+    if (!isServer) {
+        // CLIENT frames require a per-frame mask key that would corrupt the reserved
+        // prefix slot. The zero-copy fan-out pattern is server-only.
+        return nullptr;
+    }
+
+    PreparedMessage *preparedMessage = new PreparedMessage;
+    preparedMessage->buffer = new char[bodyLen + prefixLen + 10];
+
+    // formatMessage with length=0 writes only the WS header. Pass a non-null placeholder for
+    // strict UB-analyzer compatibility (memcpy with null src + length=0 is technically UB pre-C2x).
+    char placeholder[1] = {0};
+    size_t headerLength = WebSocketProtocol<isServer, WebSocket<isServer>>::formatMessage(
+        preparedMessage->buffer, placeholder, 0, opCode, prefixLen + bodyLen, compressed);
+
+    std::memcpy(preparedMessage->buffer + headerLength + prefixLen, body, bodyLen);
+
+    preparedMessage->length = headerLength + prefixLen + bodyLen;
+    preparedMessage->references = 1;
+    preparedMessage->callback = (void(*)(void *, void *, bool, void *)) callback;
+    return preparedMessage;
+}
+
+/*
  * Prepares a batch of messages to send as one single TCP packet / syscall.
  *
  * Hints: Useful when doing pub/sub-like broadcasts where many recipients should receive many
@@ -132,6 +176,7 @@ void WebSocket<isServer>::sendPrepared(typename WebSocket<isServer>::PreparedMes
     Queue::Message *messagePtr = (Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
     messagePtr->data = preparedMessage->buffer;
     messagePtr->length = preparedMessage->length;
+    uS::Socket::Queue::initMessage(messagePtr);
 
     bool wasTransferred;
     if (write(messagePtr, wasTransferred)) {
@@ -150,6 +195,73 @@ void WebSocket<isServer>::sendPrepared(typename WebSocket<isServer>::PreparedMes
         if (callback) {
             callback(this, preparedMessage, true, callbackData);
         }
+    }
+}
+
+/*
+ * Like sendPrepared, but injects per-recipient prefix bytes immediately after the WS frame
+ * header. prefix is copied into the queued Message; safe to pass stack memory.
+ * prefixLen must match the value passed to prepareMessageWithPrefix.
+ *
+ * Returns false if the send/queue could not be completed (treat as connection-broken).
+ *
+ * Not thread safe.
+ */
+template <bool isServer>
+bool WebSocket<isServer>::sendPreparedWithPrefix(typename WebSocket<isServer>::PreparedMessage *preparedMessage,
+                                                  const char *prefix, size_t prefixLen,
+                                                  void *callbackData)
+{
+    if (!isServer) {
+        // Mirrors prepareMessageWithPrefix's CLIENT guard — masking would corrupt the prefix.
+        return false;
+    }
+
+    if (prefixLen == 0 || prefixLen > sizeof(uS::Socket::Queue::Message::prefix)) {
+        return false;
+    }
+
+    preparedMessage->references++;
+    void (*callback)(void *webSocket, void *userData, bool cancelled, void *reserved) =
+        [](void *webSocket, void *userData, bool cancelled, void *reserved) {
+            PreparedMessage *preparedMessage = (PreparedMessage *) userData;
+            bool lastReference = !--preparedMessage->references;
+
+            if (preparedMessage->callback) {
+                preparedMessage->callback(webSocket, reserved, cancelled, (void *) lastReference);
+            }
+            if (lastReference) {
+                delete [] preparedMessage->buffer;
+                delete preparedMessage;
+            }
+        };
+
+    int memoryLength = sizeof(typename uS::Socket::Queue::Message);
+    int memoryIndex = nodeData->getMemoryBlockIndex(memoryLength);
+    typename uS::Socket::Queue::Message *messagePtr =
+        (typename uS::Socket::Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
+
+    messagePtr->data = preparedMessage->buffer;
+    messagePtr->length = preparedMessage->length;
+    uS::Socket::Queue::initMessage(messagePtr);
+    std::memcpy(messagePtr->prefix, prefix, prefixLen);
+    messagePtr->prefixLength = static_cast<uint8_t>(prefixLen);
+
+    bool wasTransferred;
+    if (write(messagePtr, wasTransferred)) {
+        if (!wasTransferred) {
+            nodeData->freeSmallMemoryBlock((char *) messagePtr, memoryIndex);
+            callback(this, preparedMessage, false, callbackData);
+        } else {
+            messagePtr->callback = callback;
+            messagePtr->callbackData = preparedMessage;
+            messagePtr->reserved = callbackData;
+        }
+        return true;
+    } else {
+        nodeData->freeSmallMemoryBlock((char *) messagePtr, memoryIndex);
+        callback(this, preparedMessage, true, callbackData);
+        return false;
     }
 }
 

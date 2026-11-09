@@ -68,6 +68,20 @@ public:
 
     // Not thread safe
     void sendPrepared(PreparedMessage *preparedMessage, void *callbackData = nullptr);
+    // Like sendPrepared but injects per-recipient `prefix` bytes immediately after the WS frame
+    // header. `prefix` is copied into the queued Message; safe to pass stack memory.
+    // `prefixLen` must match the value passed to prepareMessageWithPrefix.
+    //
+    // Returns false if the send/queue could not be completed (treat as connection-broken;
+    // callers should abort fan-out loops on false, mirroring `send()`'s contract).
+    //
+    // THREAD INVARIANT: prepareMessageWithPrefix/sendPreparedWithPrefix/finalizeMessage and
+    // the queue drain MUST all happen on the same uWS loop thread.
+    //
+    // Not thread safe.
+    bool sendPreparedWithPrefix(PreparedMessage *preparedMessage,
+                                const char *prefix, size_t prefixLen,
+                                void *callbackData = nullptr);
     static void finalizeMessage(PreparedMessage *preparedMessage);
     void close(int code = 1000, const char *message = nullptr, size_t length = 0);
     void transfer(Group<isServer> *group);
@@ -78,6 +92,18 @@ public:
     void send(const char *message, OpCode opCode = OpCode::TEXT) {send(message, strlen(message), opCode);}
     void send(const char *message, size_t length, OpCode opCode, void(*callback)(WebSocket<isServer> *webSocket, void *data, bool cancelled, void *reserved) = nullptr, void *callbackData = nullptr);
     static PreparedMessage *prepareMessage(char *data, size_t length, OpCode opCode, bool compressed, void(*callback)(WebSocket<isServer> *webSocket, void *data, bool cancelled, void *reserved) = nullptr);
+    // Like prepareMessage, but reserves `prefixLen` bytes immediately after the WS frame
+    // header for a per-recipient prefix patched in at send time via sendPreparedWithPrefix.
+    // The WS frame's length field is set to (prefixLen + bodyLen) so receivers see a single
+    // message of payload [prefix][body].
+    //
+    // Only supported for isServer=true (no per-frame masking); returns nullptr for CLIENT.
+    //
+    // Thread safe to call; the returned PreparedMessage must not be mutated concurrently
+    // (sendPreparedWithPrefix is not thread-safe and patches the buffer per-call).
+    static PreparedMessage *prepareMessageWithPrefix(char *body, size_t bodyLen, size_t prefixLen,
+                                                     OpCode opCode, bool compressed,
+                                                     void(*callback)(WebSocket<isServer> *webSocket, void *data, bool cancelled, void *reserved) = nullptr);
     static PreparedMessage *prepareMessageBatch(std::vector<std::string> &messages, std::vector<int> &excludedMessages,
                                                 OpCode opCode, bool compressed, void(*callback)(WebSocket<isServer> *webSocket, void *data, bool cancelled, void *reserved) = nullptr);
 

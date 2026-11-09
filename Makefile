@@ -1,3 +1,12 @@
+# Local dev loop for the vindral-cpp project:
+#   make Linux
+#   make installLocal LOCAL_PREFIX=<absolute path to vindral-cpp/local/uWS>
+# The parent project's Makefile has an `uws-install` target that does both.
+#
+# Production: the Dockerfile clones this repo from github.com/RealSprint/uWebSockets
+# and runs `make install` (root, so /usr/lib + /usr/include works there). When
+# changes need to ship, push them to that GitHub repo on a branch coordinated
+# with a Dockerfile update.
 CPP_SHARED := -std=c++11 -O3 -I src -shared -fPIC src/Extensions.cpp src/Group.cpp src/Networking.cpp src/Hub.cpp src/Node.cpp src/WebSocket.cpp src/HTTPSocket.cpp src/Socket.cpp src/Epoll.cpp
 CPP_OPENSSL_OSX := -L/usr/local/opt/openssl/lib -I/usr/local/opt/openssl/include
 CPP_OSX := -stdlib=libc++ -mmacosx-version-min=10.7 -undefined dynamic_lookup $(CPP_OPENSSL_OSX)
@@ -16,6 +25,12 @@ installLinux:
 	if [ -d "/usr/lib64" ]; then cp libuWS.so /usr/lib64/; else cp libuWS.so /usr/lib/; fi
 	mkdir -p /usr/include/uWS
 	cp src/*.h /usr/include/uWS/
+.PHONY: installLocal
+installLocal:
+	@if [ -z "$(LOCAL_PREFIX)" ]; then echo "LOCAL_PREFIX is required (absolute path)"; exit 1; fi
+	mkdir -p $(LOCAL_PREFIX)/lib $(LOCAL_PREFIX)/include/uWS
+	cp libuWS.so $(LOCAL_PREFIX)/lib/
+	cp src/*.h $(LOCAL_PREFIX)/include/uWS/
 .PHONY: installDarwin
 installDarwin:
 	cp libuWS.dylib /usr/local/lib/

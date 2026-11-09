@@ -3,6 +3,9 @@
 
 #include <openssl/err.h>
 #include "Networking.h"
+#include "PrefixFlatten.h"
+#include <sys/uio.h>
+#include <new>
 
 namespace uS {
 
@@ -40,15 +43,42 @@ protected:
         struct Message {
             const char *data;
             size_t length;
-            Message *nextMessage = nullptr;
-            void (*callback)(void *socket, void *data, bool cancelled, void *reserved) = nullptr;
-            void *callbackData = nullptr, *reserved = nullptr;
+            // Per-recipient prefix bytes injected at send time. prefixLength == 0 = legacy
+            // single-buffer path; > 0 = scatter-gather. Stored inline so each queued Message
+            // owns its own copy.
+            uint8_t prefix[8];
+            uint8_t prefixLength;
+            // When non-null: this Message owns a malloc'd buffer (pop() must `delete[]` it).
+            // Used by partial-write flatten path; distinct from `data` because `data` may
+            // advance past allocation start during partial drains.
+            char *flatOwned;
+            Message *nextMessage;
+            void (*callback)(void *socket, void *data, bool cancelled, void *reserved);
+            void *callbackData, *reserved;
         };
+
+        static_assert(sizeof(Message) <= 96,
+                      "Queue::Message size budget exceeded — verify pool bucket sizing");
+
+        // Centralized zero-init for all fields that callers don't immediately overwrite.
+        // ALL allocation sites that cast raw memory (pool blocks, new char[]) MUST call this.
+        static inline void initMessage(Message *m) {
+            std::memset(m->prefix, 0, sizeof(m->prefix));
+            m->prefixLength = 0;
+            m->flatOwned = nullptr;
+            m->nextMessage = nullptr;
+            m->callback = nullptr;
+            m->callbackData = nullptr;
+            m->reserved = nullptr;
+        }
 
         Message *head = nullptr, *tail = nullptr;
         void pop()
         {
             Message *nextMessage;
+            if (head->flatOwned) {
+                delete [] head->flatOwned;
+            }
             if ((nextMessage = head->nextMessage)) {
                 delete [] (char *) head;
                 head = nextMessage;
@@ -307,7 +337,7 @@ protected:
         Queue::Message *messagePtr = (Queue::Message *) new char[sizeof(Queue::Message) + length];
         messagePtr->length = length;
         messagePtr->data = ((char *) messagePtr) + sizeof(Queue::Message);
-        messagePtr->nextMessage = nullptr;
+        Queue::initMessage(messagePtr);
 
         if (data) {
             memcpy((char *) messagePtr->data, data, messagePtr->length);
@@ -325,35 +355,148 @@ protected:
         if (messageQueue.empty()) {
 
             if (ssl) {
-                sent = SSL_write(ssl, message->data, (int) message->length);
-                if (sent == (ssize_t) message->length) {
+                if (message->prefixLength > 0) {
+                    size_t totalLen = message->length;
+                    size_t prefixLen = message->prefixLength;
+                    uint8_t lenByte = static_cast<uint8_t>(message->data[1]) & 0x7F;
+                    size_t headerLen = (lenByte < 126) ? 2 : ((lenByte == 126) ? 4 : 10);
+                    size_t bodyLen = totalLen - headerLen - prefixLen;
+
+                    // Combine [ws-header][prefix] on stack — at most 10 + 8 = 18 bytes.
+                    char combined[18];
+                    std::memcpy(combined, message->data, headerLen);
+                    std::memcpy(combined + headerLen, message->prefix, prefixLen);
+                    size_t combinedLen = headerLen + prefixLen;
+
+                    ssize_t sent1 = SSL_write(ssl, combined, (int) combinedLen);
+                    if (sent1 == (ssize_t) combinedLen) {
+                        ssize_t sent2 = SSL_write(ssl, message->data + headerLen + prefixLen, (int) bodyLen);
+                        if (sent2 == (ssize_t) bodyLen) {
+                            wasTransferred = false;
+                            return true;
+                        } else if (sent2 <= 0) {
+                            int err = SSL_get_error(ssl, (int) sent2);
+                            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                                if ((getPoll() & UV_WRITABLE) == 0) {
+                                    setPoll(getPoll() | UV_WRITABLE);
+                                    changePoll(this);
+                                }
+                                ERR_clear_error();
+                                // Body must be retried; flatten cursor past combined header+prefix.
+                                if (!_convertPrefixMessageToContiguous(message, combinedLen, headerLen, prefixLen, bodyLen)) {
+                                    return false;
+                                }
+                                // Fall through to common queue push.
+                            } else {
+                                ERR_clear_error();
+                                return false;
+                            }
+                        } else {
+                            // Partial body.
+                            if (!_convertPrefixMessageToContiguous(message, combinedLen + sent2, headerLen, prefixLen, bodyLen)) {
+                                return false;
+                            }
+                        }
+                    } else if (sent1 <= 0) {
+                        int err = SSL_get_error(ssl, (int) sent1);
+                        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                            if ((getPoll() & UV_WRITABLE) == 0) {
+                                setPoll(getPoll() | UV_WRITABLE);
+                                changePoll(this);
+                            }
+                            ERR_clear_error();
+                            // Whole message must be retried; flatten from offset 0.
+                            if (!_convertPrefixMessageToContiguous(message, 0, headerLen, prefixLen, bodyLen)) {
+                                return false;
+                            }
+                        } else {
+                            ERR_clear_error();
+                            return false;
+                        }
+                    } else {
+                        // Partial header+prefix.
+                        if (!_convertPrefixMessageToContiguous(message, sent1, headerLen, prefixLen, bodyLen)) {
+                            return false;
+                        }
+                    }
+                } else {
+                    // Legacy single-buffer SSL path — UNCHANGED from existing code:
+                    sent = SSL_write(ssl, message->data, (int) message->length);
+                    if (sent == (ssize_t) message->length) {
+                        wasTransferred = false;
+                        return true;
+                        // CHANGED this to <= 0 instead of < 0 as 0 is regarded as error too
+                    } else if (sent <= 0) {
+                        switch (SSL_get_error(ssl, (int) sent)) {
+                        case SSL_ERROR_WANT_READ:
+                            // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                            // will keep returning the same value and screwing up our switch-/if cases
+                            ERR_clear_error();
+                            break;
+                        case SSL_ERROR_WANT_WRITE:
+                            if ((getPoll() & UV_WRITABLE) == 0) {
+                                setPoll(getPoll() | UV_WRITABLE);
+                                changePoll(this);
+                            }
+                            // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                            // will keep returning the same value and screwing up our switch-/if cases
+                            ERR_clear_error();
+                            break;
+                        default:
+                            // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
+                            // will keep returning the same value and screwing up our switch-/if cases
+                            ERR_clear_error();
+                            return false;
+                        }
+                    }
+                }
+            } else if (message->prefixLength > 0) {
+                // Scatter-gather write for prefix-mode messages.
+                // The prepared buffer has layout: [ws-header][reserved prefix slot][body]
+                // and message->prefix carries the per-recipient prefix bytes.
+                size_t totalLen = message->length;
+                size_t prefixLen = message->prefixLength;
+                uint8_t lenByte = static_cast<uint8_t>(message->data[1]) & 0x7F;
+                size_t headerLen = (lenByte < 126) ? 2 : ((lenByte == 126) ? 4 : 10);
+                size_t bodyLen = totalLen - headerLen - prefixLen;
+
+                struct iovec iov[3];
+                iov[0].iov_base = const_cast<char*>(message->data);
+                iov[0].iov_len = headerLen;
+                iov[1].iov_base = message->prefix;
+                iov[1].iov_len = prefixLen;
+                iov[2].iov_base = const_cast<char*>(message->data) + headerLen + prefixLen;
+                iov[2].iov_len = bodyLen;
+
+                ssize_t expectedTotal = static_cast<ssize_t>(headerLen + prefixLen + bodyLen);
+                sent = ::writev(getFd(), iov, 3);
+                if (sent == expectedTotal) {
                     wasTransferred = false;
                     return true;
-                    // CHANGED this to <= 0 instead of < 0 as 0 is regarded as error too
-                } else if (sent <= 0) {
-                    switch (SSL_get_error(ssl, (int) sent)) {
-                    case SSL_ERROR_WANT_READ:
-                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
-                        // will keep returning the same value and screwing up our switch-/if cases
-                        ERR_clear_error();
-                        break;
-                    case SSL_ERROR_WANT_WRITE:
-                        if ((getPoll() & UV_WRITABLE) == 0) {
-                            setPoll(getPoll() | UV_WRITABLE);
-                            changePoll(this);
-                        }
-                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
-                        // will keep returning the same value and screwing up our switch-/if cases
-                        ERR_clear_error();
-                        break;
-                    default:
-                        // CHANGED error needs to be reset every time it has been set, otherwise the SSL_get_error
-                        // will keep returning the same value and screwing up our switch-/if cases
-                        ERR_clear_error();
+                }
+                if (sent == UWS_SOCKET_ERROR) {
+                    if (!nodeData->netContext->wouldBlock()) {
+                        return false;
+                    }
+                    // EAGAIN/would-block: 0 bytes sent. Must flatten before queueing because
+                    // the legacy drain loop has no concept of prefixLength.
+                    if (!_convertPrefixMessageToContiguous(message, 0, headerLen, prefixLen, bodyLen)) {
+                        return false;
+                    }
+                    // Fall through to the common queue push at the bottom of write().
+                } else if (sent >= 0) {
+                    // Partial write (including sent==0). Flatten remainder.
+                    if (!_convertPrefixMessageToContiguous(message, sent, headerLen, prefixLen, bodyLen)) {
                         return false;
                     }
                 }
+
+                if ((getPoll() & UV_WRITABLE) == 0) {
+                    setPoll(getPoll() | UV_WRITABLE);
+                    changePoll(this);
+                }
             } else {
+                // Legacy single-buffer non-SSL path (UNCHANGED from existing code):
                 sent = ::send(getFd(), message->data, message->length, MSG_NOSIGNAL);
                 if (sent == (ssize_t) message->length) {
                     wasTransferred = false;
@@ -373,6 +516,20 @@ protected:
                 }
             }
         }
+        // If this is a prefix-mode message that was never written (queue was non-empty
+        // on entry so we skipped straight here), flatten it now before enqueuing.
+        // The legacy drain loops (ioHandler / sslIoHandler) only know how to drain
+        // contiguous messages — they have no concept of prefixLength.
+        if (message->prefixLength > 0) {
+            size_t totalLen = message->length;
+            size_t prefixLen = message->prefixLength;
+            uint8_t lenByte = static_cast<uint8_t>(message->data[1]) & 0x7F;
+            size_t headerLen = (lenByte < 126) ? 2 : ((lenByte == 126) ? 4 : 10);
+            size_t bodyLen = totalLen - headerLen - prefixLen;
+            if (!_convertPrefixMessageToContiguous(message, 0, headerLen, prefixLen, bodyLen)) {
+                return false;
+            }
+        }
         messageQueue.push(message);
         wasTransferred = true;
         return true;
@@ -388,6 +545,7 @@ protected:
                 int memoryIndex = nodeData->getMemoryBlockIndex(memoryLength);
 
                 Queue::Message *messagePtr = (Queue::Message *) nodeData->getSmallMemoryBlock(memoryIndex);
+                Queue::initMessage(messagePtr);
                 messagePtr->data = ((char *) messagePtr) + sizeof(Queue::Message);
                 messagePtr->length = T::transform(message, (char *) messagePtr->data, length, transformData);
 
@@ -437,6 +595,46 @@ protected:
             messagePtr->callbackData = callbackData;
             enqueue(messagePtr);
         }
+    }
+
+private:
+    // Flatten the unsent remainder of a scatter-gather prefix message into a contiguous
+    // buffer owned via `flatOwned`. After this call, the message is legacy-compatible
+    // (prefixLength == 0, data points at the flat buffer, length == remaining bytes,
+    // flatOwned == data so pop() will free it).
+    //
+    // Returns false ONLY on allocation failure (treat as connection-broken).
+    bool _convertPrefixMessageToContiguous(Queue::Message *message, ssize_t alreadySent,
+                                           size_t headerLen, size_t prefixLen, size_t bodyLen) {
+        size_t totalLen = headerLen + prefixLen + bodyLen;
+        if (alreadySent < 0) alreadySent = 0;
+        if (static_cast<size_t>(alreadySent) >= totalLen) {
+            // Fully sent — caller treats this as "no need to queue".
+            message->prefixLength = 0;
+            message->length = 0;
+            return true;
+        }
+
+        size_t remaining = totalLen - static_cast<size_t>(alreadySent);
+        char *flat = nullptr;
+        try {
+            flat = new char[remaining];
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+
+        prefix_flatten_detail::flattenRemainder(
+            flat,
+            message->data, headerLen,
+            reinterpret_cast<const char*>(message->prefix), prefixLen,
+            message->data + headerLen + prefixLen, bodyLen,
+            static_cast<size_t>(alreadySent));
+
+        message->data = flat;
+        message->length = remaining;
+        message->prefixLength = 0;
+        message->flatOwned = flat;
+        return true;
     }
 
 public:
